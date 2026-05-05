@@ -784,12 +784,12 @@ module MZD88
     def usage
       puts <<~USAGE
         usage:
-          ruby mdz88.rb -blank OUTPUT.d88 [--title TITLE]
-          ruby mdz88.rb -list IMAGE.d88 [--free]
-          ruby mdz88.rb -add IMAGE.d88 SOURCE... [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]
-          ruby mdz88.rb -extract IMAGE.d88 NAME OUTPUT
-          ruby mdz88.rb -delete IMAGE.d88 NAME... | --all
-          ruby mdz88.rb -rename IMAGE.d88 OLD_NAME NEW_NAME
+          ruby mzd88.rb -blank OUTPUT.d88 [--title TITLE]
+          ruby mzd88.rb -list IMAGE.d88 [--free]
+          ruby mzd88.rb -add IMAGE.d88 SOURCE... [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]
+          ruby mzd88.rb -extract IMAGE.d88 NAME OUTPUT
+          ruby mzd88.rb -delete IMAGE.d88 NAME... | --all
+          ruby mzd88.rb -rename IMAGE.d88 OLD_NAME NEW_NAME
       USAGE
     end
   end
