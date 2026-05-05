@@ -263,8 +263,11 @@ module MZD88
       if mode == MODE_BRD
         start_record, blocks = write_brd_data(data)
         length = (data.bytesize + 31) / 32
+      elsif mode == MODE_BSD
+        start_record, blocks = write_bsd_data(data)
+        length = data.bytesize
       else
-        start_record, blocks = write_linear_data(data, duplicate_single_sector: mode == MODE_BSD)
+        start_record, blocks = write_linear_data(data)
         length = data.bytesize
       end
 
@@ -320,7 +323,12 @@ module MZD88
       raise Error, "file not found: #{name}" unless found
 
       index, entry = found
-      blocks = entry.mode == MODE_BRD ? brd_blocks(entry) : linear_blocks(entry)
+      blocks =
+        case entry.mode
+        when MODE_BRD then brd_blocks(entry)
+        when MODE_BSD then bsd_blocks(entry)
+        else linear_blocks(entry)
+        end
       blocks.each { |block| write_block(block, "\xBF".b * (BLOCK_FACTOR * SECTOR_SIZE)) }
       mark_blocks(blocks, false)
       write_directory_entry(index, DirectoryEntry.empty(index))
@@ -332,7 +340,12 @@ module MZD88
       raise Error, "file not found: #{name}" unless found
 
       _index, entry = found
-      data = entry.mode == MODE_BRD ? read_brd_data(entry) : read_linear_data(entry)
+      data =
+        case entry.mode
+        when MODE_BRD then read_brd_data(entry)
+        when MODE_BSD then read_bsd_data(entry)
+        else read_linear_data(entry)
+        end
       File.binwrite(output_path, data.byteslice(0, entry.byte_length))
     end
 
@@ -464,18 +477,12 @@ module MZD88
       DIRECTORY_ENTRIES.times.find { |i| !read_directory_entry(i).used? && i != 0 }
     end
 
-    def write_linear_data(data, duplicate_single_sector: false)
+    def write_linear_data(data)
       block_count = [(data.bytesize + (BLOCK_FACTOR * SECTOR_SIZE) - 1) / (BLOCK_FACTOR * SECTOR_SIZE), 1].max
       start_block = find_free_run(block_count)
       raise Error, "not enough contiguous free space" unless start_block
 
-      payload =
-        if duplicate_single_sector && data.bytesize <= SECTOR_SIZE
-          sector = data.b.ljust(SECTOR_SIZE, "\x00")
-          sector + sector
-        else
-          data.b.ljust(block_count * BLOCK_FACTOR * SECTOR_SIZE, "\x00")
-        end
+      payload = data.b.ljust(block_count * BLOCK_FACTOR * SECTOR_SIZE, "\x00")
       block_count.times do |i|
         write_block(start_block + i, payload.byteslice(i * BLOCK_FACTOR * SECTOR_SIZE, BLOCK_FACTOR * SECTOR_SIZE))
       end
@@ -492,6 +499,49 @@ module MZD88
       block_count = [(entry.byte_length + (BLOCK_FACTOR * SECTOR_SIZE) - 1) / (BLOCK_FACTOR * SECTOR_SIZE), 1].max
       start_block = entry.start_record / BLOCK_FACTOR
       block_count.times.map { |i| start_block + i }
+    end
+
+    def write_bsd_data(data)
+      record_count = [(data.bytesize + 253) / 254, 1].max
+      block_count = [(record_count + BLOCK_FACTOR - 1) / BLOCK_FACTOR, 1].max
+      start_block = find_free_run(block_count)
+      raise Error, "not enough contiguous free space" unless start_block
+
+      start_record = start_block * BLOCK_FACTOR
+      block_count.times { |i| write_block(start_block + i, "\xBF".b * (BLOCK_FACTOR * SECTOR_SIZE)) }
+
+      record_count.times do |i|
+        record = start_record + i
+        next_record = i == record_count - 1 ? 0 : record + 1
+        chunk = data.byteslice(i * 254, 254) || "".b
+        record_data = chunk.ljust(SECTOR_SIZE, "\x00")
+        MZD88.put_le16(record_data, 254, next_record)
+        write_record(record, record_data)
+      end
+
+      [start_record, block_count.times.map { |i| start_block + i }]
+    end
+
+    def read_bsd_data(entry)
+      records = bsd_records(entry)
+      records.map { |record| read_record(record).byteslice(0, 254) }.join.b
+    end
+
+    def bsd_records(entry)
+      records = []
+      record = entry.start_record
+      expected_records = [(entry.byte_length + 253) / 254, 1].max
+      expected_records.times do
+        records << record
+        data = read_record(record)
+        record = MZD88.le16(data, 254)
+        break if record.zero?
+      end
+      records
+    end
+
+    def bsd_blocks(entry)
+      bsd_records(entry).map { |record| record / BLOCK_FACTOR }.uniq
     end
 
     def write_brd_data(data)
