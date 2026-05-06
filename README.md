@@ -32,14 +32,68 @@ ruby mzd88.rb -delete disk.d88 --all
 
 C99対応コンパイラでビルドできます。
 
+Linux/WSL/macOSなど:
+
 ```sh
 gcc -std=c99 -O2 -Wall -Wextra -o mzd88 mzd88.c
 ```
 
-WindowsでMinGW等を使う場合:
+Windows + MinGW-w64/MSYS2の場合:
 
 ```sh
 gcc -std=c99 -O2 -Wall -Wextra -o mzd88.exe mzd88.c
+```
+
+Windows + Visual Studio 2022の場合:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cl /nologo /W4 /O2 /Fe:mzd88.exe mzd88.c
+```
+
+ビルド確認済み:
+
+- WSL gcc
+- Visual Studio 2022 MSVC (`cl /W4`)
+
+### VSCodeでMINGW64ターミナルを使う
+
+MSYS2のMINGW64環境をVSCodeのターミナルから使う場合は、VSCodeの `settings.json` にプロファイルを追加します。
+
+```json
+{
+  "terminal.integrated.profiles.windows": {
+    "MINGW64": {
+      "path": "C:\\msys64\\usr\\bin\\bash.exe",
+      "args": ["--login", "-i"],
+      "env": {
+        "MSYSTEM": "MINGW64",
+        "CHERE_INVOKING": "1"
+      }
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "MINGW64"
+}
+```
+
+UCRT64を使う場合は `MSYSTEM` を `UCRT64` にします。
+
+```json
+"MSYSTEM": "UCRT64"
+```
+
+MINGW64環境にgccが入っていない場合は、MSYS2のMINGW64ターミナルで以下を実行します。
+
+```sh
+pacman -Syu
+pacman -S mingw-w64-x86_64-gcc
+```
+
+UCRT64環境の場合:
+
+```sh
+pacman -Syu
+pacman -S mingw-w64-ucrt-x86_64-gcc
 ```
 
 使い方はRuby版と同じです。
