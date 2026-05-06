@@ -55,6 +55,14 @@ typedef struct {
     uint16_t start_record;
 } DirectoryEntry;
 
+static void copy_cstr(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return;
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static void die(const char *message) {
     fprintf(stderr, "error: %s\n", message);
     exit(1);
@@ -146,7 +154,6 @@ static uint8_t parse_mode(const char *value) {
     if (streq(lower, "bsd") || streq(lower, "bas") || streq(lower, "txt")) return MODE_BSD;
     if (streq(lower, "brd")) return MODE_BRD;
     die2("unknown mode: ", value);
-    return MODE_BSD;
 }
 
 static uint16_t parse_word(const char *text, const char *option_name) {
@@ -157,7 +164,7 @@ static uint16_t parse_word(const char *text, const char *option_name) {
         fprintf(stderr, "error: invalid %s: %s\n", option_name, text);
         exit(1);
     }
-    strcpy(buf, text);
+    copy_cstr(buf, sizeof(buf), text);
     if (len > 1 && (buf[len - 1] == 'h' || buf[len - 1] == 'H')) {
         buf[len - 1] = '\0';
         base = 16;
@@ -258,7 +265,7 @@ static void build_blank_d88(Disk *disk, const char *title) {
     put_le32(disk->bytes + 0x1c, DISK_SIZE);
 
     for (int track = 0; track < TRACKS; track++) {
-        put_le32(disk->bytes + 0x20 + track * 4, HEADER_SIZE + (uint32_t)track * TRACK_SIZE);
+        put_le32(disk->bytes + 0x20 + track * 4, (uint32_t)(HEADER_SIZE + track * TRACK_SIZE));
     }
 
     for (int track = 0; track < TRACKS; track++) {
@@ -385,11 +392,11 @@ static void write_bitmap(Disk *disk, const uint8_t used[DATA_BLOCKS]) {
     for (int i = 0; i < DATA_BLOCKS; i++) if (used[i]) used_count++;
     data[0] = 0x01;
     data[1] = DATA_OFFSET_BLOCK;
-    put_le16(data + 2, DATA_OFFSET_BLOCK + used_count);
+    put_le16(data + 2, (uint16_t)(DATA_OFFSET_BLOCK + used_count));
     put_le16(data + 4, TOTAL_BLOCKS);
     data[255] = BLOCK_FACTOR - 1;
     for (int i = 0; i < DATA_BLOCKS; i++) {
-        if (used[i]) data[6 + i / 8] |= (uint8_t)(1 << (i % 8));
+        if (used[i]) data[6 + i / 8] = (uint8_t)(data[6 + i / 8] | (uint8_t)(1 << (i % 8)));
     }
     write_record(disk, BITMAP_RECORD, data);
 }
@@ -631,7 +638,7 @@ static void add_file(Disk *disk, const char *source_path, const char *name_optio
         size_t len = strlen(name_option);
         if (len == 0) die("name is empty");
         if (len > 17) die2("name is longer than 17 bytes: ", name_option);
-        strcpy(name, name_option);
+        copy_cstr(name, sizeof(name), name_option);
     } else {
         default_disk_name(source_path, name);
     }
@@ -674,7 +681,7 @@ static void add_file(Disk *disk, const char *source_path, const char *name_optio
     DirectoryEntry entry;
     empty_entry(entry_index, &entry);
     entry.mode = mode;
-    strcpy(entry.name, name);
+    copy_cstr(entry.name, sizeof(entry.name), name);
     entry.length = length;
     entry.load_addr = has_load ? load_addr : 0;
     entry.exec_addr = has_exec ? exec_addr : 0;
@@ -896,7 +903,7 @@ static void cmd_delete(int argc, char **argv) {
         for (int idx = 0; idx < DIRECTORY_ENTRIES; idx++) {
             DirectoryEntry entry;
             read_directory_entry(&disk, idx, &entry);
-            if (entry_used(&entry)) strcpy(names[count++], entry.name);
+            if (entry_used(&entry)) copy_cstr(names[count++], sizeof(names[0]), entry.name);
         }
         for (int n = 0; n < count; n++) {
             DirectoryEntry entry = delete_one(&disk, names[n]);
@@ -925,7 +932,7 @@ static void cmd_rename(int argc, char **argv) {
     DirectoryEntry entry;
     int index = find_entry(&disk, old_name, &entry);
     if (index < 0) die2("file not found: ", old_name);
-    strcpy(entry.name, new_name);
+    copy_cstr(entry.name, sizeof(entry.name), new_name);
     encode_time_bytes(entry.timestamp);
     write_directory_entry(&disk, index, &entry);
     save_disk(&disk, argv[0]);
