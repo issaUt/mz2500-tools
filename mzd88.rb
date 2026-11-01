@@ -189,6 +189,16 @@ module MZD88
       @mode == MODE_BRD ? @length * 32 : @length
     end
 
+    def timestamp_text
+      b0, b1, b2, b3 = @timestamp.bytes
+      year = (b0 >> 4) * 10 + (b0 & 15)
+      month = ((b1 >> 7) * 10) + ((b1 >> 3) & 15)
+      day = (((b1 >> 1) & 3) * 10) + ((b1 & 1) << 3) + (b2 >> 5)
+      hour = (((b2 >> 3) & 3) * 10) + ((b2 & 7) << 1) + (b3 >> 7)
+      minute = (((b3 >> 4) & 7) * 10) + (b3 & 15)
+      "%02d-%02d-%02d %02d:%02d" % [year, month, day, hour, minute]
+    end
+
     def to_bytes
       raw = "\x00".b * DIRECTORY_ENTRY_SIZE
       raw.setbyte(0, @mode || MODE_UNUSED)
@@ -237,27 +247,30 @@ module MZD88
       self
     end
 
-    def list_entries
-      DIRECTORY_ENTRIES.times.map { |i| [i, read_directory_entry(i)] }.select { |_i, e| e.used? }
+    def list_entries(path = "/", include_special: false)
+      base = resolve_directory(path)
+      DIRECTORY_ENTRIES.times.map { |i| [i, read_directory_entry(i, base)] }
+                       .select { |_i, e| e.used? && (include_special || ![".", ".."].include?(e.name)) }
     end
 
-    def find_entry(name)
-      target = disk_name_string(name)
-      list_entries.find { |_i, e| e.name == target }
+    def find_entry(path)
+      base, name = parent_and_name(path)
+      find_in_directory(base, name)
     end
 
     def add_file(source_path, disk_name: nil, mode: nil, force: false, load_addr: nil, exec_addr: nil)
       data = File.binread(source_path)
       disk_name ||= File.basename(source_path).sub(/\.[^.]*\z/, "")
       mode ||= infer_mode(source_path)
-      disk_name = disk_name_string(disk_name)
-      raise Error, "name is empty" if disk_name.empty?
-      raise Error, "name is longer than 17 bytes: #{disk_name}" if disk_name.bytesize > 17
-      raise Error, "file already exists: #{disk_name}" if !force && find_entry(disk_name)
+      base, disk_name = parent_and_name(disk_name)
+      validate_name!(disk_name)
+      existing = find_in_directory(base, disk_name)
+      raise Error, "file already exists: #{disk_name}" if !force && existing
 
-      delete_file(disk_name) if force && find_entry(disk_name)
+      raise Error, "cannot replace a directory: #{disk_name}" if existing && existing[1].mode == MODE_DIR
+      delete_file(disk_name, base: base) if force && existing
 
-      entry_index = find_empty_directory_index
+      entry_index = find_empty_directory_index(base)
       raise Error, "directory is full" unless entry_index
 
       if mode == MODE_BRD
@@ -279,30 +292,31 @@ module MZD88
       entry.exec_addr = exec_addr || 0
       entry.start_record = start_record
       entry.timestamp = encode_time(Time.now)
-      write_directory_entry(entry_index, entry)
+      write_directory_entry(entry_index, entry, base)
       mark_blocks(blocks, true)
       entry
     end
 
     def rename_file(old_name, new_name)
-      new_name = disk_name_string(new_name)
-      raise Error, "name is empty" if new_name.empty?
-      raise Error, "name is longer than 17 bytes: #{new_name}" if new_name.bytesize > 17
-      raise Error, "file already exists: #{new_name}" if find_entry(new_name)
+      old_base, old_leaf = parent_and_name(old_name)
+      new_base, new_leaf = parent_and_name(new_name)
+      raise Error, "moving between directories is not supported" unless old_base == new_base
+      validate_name!(new_leaf)
+      raise Error, "file already exists: #{new_leaf}" if find_in_directory(new_base, new_leaf)
 
-      found = find_entry(old_name)
+      found = find_in_directory(old_base, old_leaf)
       raise Error, "file not found: #{old_name}" unless found
 
       index, entry = found
-      entry.name = new_name
+      entry.name = new_leaf
       entry.timestamp = encode_time(Time.now)
-      write_directory_entry(index, entry)
+      write_directory_entry(index, entry, old_base)
       entry
     end
 
-    def delete_all_files
-      entries = list_entries
-      entries.each { |_index, entry| delete_file(entry.name) }
+    def delete_all_files(path = "/")
+      entries = list_entries(path)
+      entries.each { |_index, entry| delete_file([path, entry.name].join("/"), recursive: true) }
       entries.map(&:last)
     end
 
@@ -318,11 +332,18 @@ module MZD88
       used_blocks.count(true)
     end
 
-    def delete_file(name)
-      found = find_entry(name)
+    def delete_file(name, base: nil, recursive: false)
+      base, leaf = parent_and_name(name) unless base
+      leaf ||= name
+      found = find_in_directory(base, leaf)
       raise Error, "file not found: #{name}" unless found
 
       index, entry = found
+      if entry.mode == MODE_DIR
+        children = list_entries(name)
+        raise Error, "directory is not empty: #{name}" if !recursive && !children.empty?
+        children.each { |_child_index, child| delete_file([name, child.name].join("/"), recursive: true) }
+      end
       blocks =
         case entry.mode
         when MODE_BRD then brd_blocks(entry)
@@ -331,7 +352,7 @@ module MZD88
         end
       blocks.each { |block| write_block(block, "\xBF".b * (BLOCK_FACTOR * SECTOR_SIZE)) }
       mark_blocks(blocks, false)
-      write_directory_entry(index, DirectoryEntry.empty(index))
+      write_directory_entry(index, DirectoryEntry.empty(index), base)
       entry
     end
 
@@ -340,6 +361,7 @@ module MZD88
       raise Error, "file not found: #{name}" unless found
 
       _index, entry = found
+      raise Error, "cannot extract a directory: #{name}" if entry.mode == MODE_DIR
       data =
         case entry.mode
         when MODE_BRD then read_brd_data(entry)
@@ -349,18 +371,61 @@ module MZD88
       File.binwrite(output_path, data.byteslice(0, entry.byte_length))
     end
 
-    def read_directory_entry(index)
-      record = DIRECTORY_START_RECORD + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE)
+    def read_directory_entry(index, base = DIRECTORY_START_RECORD)
+      record = base + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE)
       offset = (index * DIRECTORY_ENTRY_SIZE) % SECTOR_SIZE
       DirectoryEntry.parse(read_record(record).byteslice(offset, DIRECTORY_ENTRY_SIZE), index: index)
     end
 
-    def write_directory_entry(index, entry)
-      record = DIRECTORY_START_RECORD + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE)
+    def write_directory_entry(index, entry, base = DIRECTORY_START_RECORD)
+      record = base + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE)
       offset = (index * DIRECTORY_ENTRY_SIZE) % SECTOR_SIZE
       data = read_record(record)
       data[offset, DIRECTORY_ENTRY_SIZE] = entry.to_bytes
       write_record(record, data)
+    end
+
+    def make_directory(path)
+      base, name = parent_and_name(path)
+      validate_name!(name)
+      raise Error, "file already exists: #{name}" if find_in_directory(base, name)
+      index = find_empty_directory_index(base)
+      raise Error, "directory is full" unless index
+      start_block = find_free_run(DIRECTORY_RECORDS / BLOCK_FACTOR)
+      raise Error, "not enough contiguous free space" unless start_block
+
+      child = start_block * BLOCK_FACTOR
+      blocks = (start_block...(start_block + DIRECTORY_RECORDS / BLOCK_FACTOR)).to_a
+      mark_blocks(blocks, true)
+      DIRECTORY_RECORDS.times { |i| write_record(child + i, "\x00".b * SECTOR_SIZE) }
+      timestamp = encode_time(Time.now)
+      swap = DirectoryEntry.empty(0)
+      swap.name = name
+      swap.attr = 0x81
+      swap.length = DIRECTORY_RECORDS * SECTOR_SIZE
+      swap.load_addr = path_parts(path).length + 1
+      swap.start_record = child
+      swap.timestamp = timestamp
+      write_directory_entry(0, swap, child)
+      [[1, ".", child], [2, "..", base]].each do |i, special_name, target|
+        special = DirectoryEntry.empty(i)
+        special.mode = MODE_DIR
+        special.name = special_name
+        special.attr = 0x81
+        special.length = DIRECTORY_RECORDS * SECTOR_SIZE
+        special.start_record = target
+        special.timestamp = timestamp
+        write_directory_entry(i, special, child)
+      end
+      entry = DirectoryEntry.empty(index)
+      entry.mode = MODE_DIR
+      entry.name = name
+      entry.attr = 0x80
+      entry.length = DIRECTORY_RECORDS * SECTOR_SIZE
+      entry.start_record = child
+      entry.timestamp = timestamp
+      write_directory_entry(index, entry, base)
+      entry
     end
 
     def read_record(record)
@@ -376,6 +441,40 @@ module MZD88
     end
 
     private
+
+    def path_parts(path)
+      parts = disk_name_string(path).tr("\\", "/").split("/").reject(&:empty?)
+      raise Error, "invalid path: #{path}" if parts.any? { |part| part == "." || part == ".." }
+      parts
+    end
+
+    def resolve_directory(path)
+      path_parts(path).reduce(DIRECTORY_START_RECORD) do |base, part|
+        found = find_in_directory(base, part)
+        raise Error, "directory not found: #{part}" unless found && found[1].mode == MODE_DIR
+        child = found[1].start_record
+        raise Error, "invalid directory location: #{child}" unless child.even? &&
+          (DATA_START_RECORD..(TOTAL_RECORDS - DIRECTORY_RECORDS)).cover?(child)
+        child
+      end
+    end
+
+    def parent_and_name(path)
+      parts = path_parts(path)
+      raise Error, "name is empty" if parts.empty?
+      [resolve_directory(parts[0...-1].join("/")), parts.last]
+    end
+
+    def validate_name!(name)
+      raise Error, "name is empty" if name.empty?
+      raise Error, "name is longer than 16 bytes: #{name}" if name.bytesize > 16
+      raise Error, "invalid name: #{name}" if name.include?("\r")
+    end
+
+    def find_in_directory(base, name)
+      DIRECTORY_ENTRIES.times.map { |i| [i, read_directory_entry(i, base)] }
+                       .find { |_i, entry| entry.used? && entry.name == name }
+    end
 
     def record_to_track_sector(record)
       raise Error, "record out of range: #{record}" unless (0...TOTAL_RECORDS).cover?(record)
@@ -473,8 +572,8 @@ module MZD88
       nil
     end
 
-    def find_empty_directory_index
-      DIRECTORY_ENTRIES.times.find { |i| !read_directory_entry(i).used? && i != 0 }
+    def find_empty_directory_index(base = DIRECTORY_START_RECORD)
+      DIRECTORY_ENTRIES.times.find { |i| !read_directory_entry(i, base).used? && i != 0 }
     end
 
     def write_linear_data(data)
@@ -629,8 +728,6 @@ module MZD88
     end
 
     def encode_time(time)
-      # The MZ directory stores a packed BCD-like timestamp. Exact preservation is
-      # not required for file loading, but this keeps entries non-zero and readable.
       year = time.year % 100
       month = time.month
       day = time.day
@@ -638,9 +735,9 @@ module MZD88
       min = time.min
       [
         ((year / 10) << 4) | (year % 10),
-        ((month / 10) << 4) | (month % 10),
-        ((day / 10) << 4) | (day % 10),
-        ((hour / 10) << 4) | (hour % 10)
+        ((month / 10) << 7) | ((month % 10) << 3) | ((day / 10) << 1) | ((day % 10) >> 3),
+        (((day % 10) & 7) << 5) | ((hour / 10) << 3) | ((hour % 10) >> 1),
+        (((hour % 10) & 1) << 7) | ((min / 10) << 4) | (min % 10)
       ].pack("C*")
     end
   end
@@ -662,6 +759,8 @@ module MZD88
         list(argv)
       when "add"
         add(argv)
+      when "mkdir"
+        mkdir(argv)
       when "delete", "del", "rm"
         delete(argv)
       when "rename", "ren", "mv"
@@ -699,12 +798,13 @@ module MZD88
       end
       opts.parse!(argv)
       path = argv.fetch(0) { raise Error, "missing D88 path" }
+      directory = argv.fetch(1, "/")
       disk = Disk.load(path)
-      puts "idx mode name              bytes  start  load  exec"
-      disk.list_entries.each do |index, entry|
-        puts "%3d %-4s %-17s %6d  %04X  %04X  %04X" % [
+      puts "idx mode name              bytes  start  load  exec  date"
+      disk.list_entries(directory).each do |index, entry|
+        puts "%3d %-4s %-17s %6d  %04X  %04X  %04X  %s" % [
           index, entry.mode_name, entry.name, entry.byte_length,
-          entry.start_record, entry.load_addr, entry.exec_addr
+          entry.start_record, entry.load_addr, entry.exec_addr, entry.timestamp_text
         ]
       end
       puts "free: #{disk.free_bytes} bytes (#{disk.free_blocks} blocks)" if show_free
@@ -713,12 +813,14 @@ module MZD88
     def add(argv)
       mode = nil
       name = nil
+      directory = "/"
       force = false
       load_addr = nil
       exec_addr = nil
       opts = OptionParser.new do |o|
         o.on("--mode MODE", "bsd, brd, btx, obj") { |v| mode = parse_mode(v) }
         o.on("--name NAME") { |v| name = v }
+        o.on("--dir PATH") { |v| directory = v }
         o.on("--force") { force = true }
         o.on("--load-addr ADDR") { |v| load_addr = parse_word(v, "--load-addr") }
         o.on("--exec-addr ADDR") { |v| exec_addr = parse_word(v, "--exec-addr") }
@@ -733,6 +835,7 @@ module MZD88
       end
 
       disk = File.exist?(image_path) ? Disk.load(image_path) : Disk.blank
+      disk.list_entries(directory)
       entries = source_paths.map do |source_path|
         source_mode = mode || parse_mode_from_path(source_path)
         if (load_addr || exec_addr) && source_mode != MODE_OBJ
@@ -740,7 +843,7 @@ module MZD88
         end
         disk.add_file(
           source_path,
-          disk_name: name,
+          disk_name: [directory, name || File.basename(source_path).sub(/\.[^.]*\z/, "")].join("/"),
           mode: source_mode,
           force: force,
           load_addr: load_addr,
@@ -753,10 +856,24 @@ module MZD88
       end
     end
 
+    def mkdir(argv)
+      image_path = argv.fetch(0) { raise Error, "missing D88 path" }
+      names = argv.drop(1)
+      raise Error, "missing directory path" if names.empty?
+      disk = Disk.load(image_path)
+      names.each { |name| disk.make_directory(name) }
+      disk.save(image_path)
+      names.each { |name| puts "created #{name}" }
+    end
+
     def delete(argv)
       delete_all = false
+      recursive = false
+      directory = "/"
       opts = OptionParser.new do |o|
         o.on("--all") { delete_all = true }
+        o.on("--recursive") { recursive = true }
+        o.on("--dir PATH") { |v| directory = v }
       end
       opts.parse!(argv)
       image_path = argv.fetch(0) { raise Error, "missing D88 path" }
@@ -766,11 +883,11 @@ module MZD88
         if delete_all
           raise Error, "--all cannot be combined with file names" unless names.empty?
 
-          disk.delete_all_files
+          disk.delete_all_files(directory)
         else
           raise Error, "missing file name" if names.empty?
 
-          names.map { |name| disk.delete_file(name) }
+          names.map { |name| disk.delete_file(name, recursive: recursive) }
         end
       disk.save(image_path)
       entries.each { |entry| puts "deleted #{entry.name}" }
@@ -835,11 +952,12 @@ module MZD88
       puts <<~USAGE
         usage:
           ruby mzd88.rb -blank OUTPUT.d88 [--title TITLE]
-          ruby mzd88.rb -list IMAGE.d88 [--free]
-          ruby mzd88.rb -add IMAGE.d88 SOURCE... [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]
-          ruby mzd88.rb -extract IMAGE.d88 NAME OUTPUT
-          ruby mzd88.rb -delete IMAGE.d88 NAME... | --all
-          ruby mzd88.rb -rename IMAGE.d88 OLD_NAME NEW_NAME
+          ruby mzd88.rb -list IMAGE.d88 [DIR] [--free]
+          ruby mzd88.rb -mkdir IMAGE.d88 DIR...
+          ruby mzd88.rb -add IMAGE.d88 SOURCE... [--dir DIR] [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]
+          ruby mzd88.rb -extract IMAGE.d88 PATH OUTPUT
+          ruby mzd88.rb -delete IMAGE.d88 PATH... [--recursive] | --all [--dir DIR]
+          ruby mzd88.rb -rename IMAGE.d88 OLD_PATH NEW_PATH
       USAGE
     end
   end

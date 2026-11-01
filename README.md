@@ -26,6 +26,11 @@ ruby mzd88.rb -extract disk.d88 FILENAME output.bin
 ruby mzd88.rb -rename disk.d88 OLD_NAME NEW_NAME
 ruby mzd88.rb -delete disk.d88 NAME1 NAME2
 ruby mzd88.rb -delete disk.d88 --all
+ruby mzd88.rb -mkdir disk.d88 SRC SRC/LIB
+ruby mzd88.rb -add disk.d88 program.obj --dir SRC/LIB
+ruby mzd88.rb -list disk.d88 SRC/LIB
+ruby mzd88.rb -extract disk.d88 SRC/LIB/program program.obj
+ruby mzd88.rb -delete disk.d88 SRC --recursive
 ```
 
 ## C版
@@ -96,7 +101,7 @@ pacman -Syu
 pacman -S mingw-w64-ucrt-x86_64-gcc
 ```
 
-使い方はRuby版と同じです。
+C版もRuby版と同じ階層ディレクトリ操作に対応しています。日付も同じ4バイト形式で記録・表示します。
 
 ```sh
 ./mzd88 -blank disk.d88
@@ -107,6 +112,10 @@ pacman -S mingw-w64-ucrt-x86_64-gcc
 ./mzd88 -rename disk.d88 OLD_NAME NEW_NAME
 ./mzd88 -delete disk.d88 NAME1 NAME2
 ./mzd88 -delete disk.d88 --all
+./mzd88 -mkdir disk.d88 SRC SRC/LIB
+./mzd88 -add disk.d88 program.obj --dir SRC/LIB
+./mzd88 -list disk.d88 SRC/LIB
+./mzd88 -delete disk.d88 SRC --recursive
 ```
 
 ## 主な機能
@@ -119,6 +128,9 @@ pacman -S mingw-w64-ucrt-x86_64-gcc
 - ファイル削除、複数削除、全削除
 - ファイル名変更
 - OBJのロードアドレス/実行アドレス指定
+- 階層ディレクトリの作成、階層内のファイル追加・抽出・名前変更・削除
+- `--recursive` によるディレクトリ全体の削除、`--all --dir DIR` によるディレクトリ内容の全削除
+- 登録日付は資料記載の4バイト形式で年月日・時分を記録（一覧は年2桁表示）
 
 ## ライセンス
 

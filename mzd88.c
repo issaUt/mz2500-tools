@@ -25,6 +25,7 @@
 
 #define BITMAP_RECORD 0x000f
 #define DIRECTORY_START_RECORD 0x0010
+#define DIRECTORY_RECORDS 8
 #define DIRECTORY_ENTRIES 64
 #define DIRECTORY_ENTRY_SIZE 32
 
@@ -42,6 +43,7 @@
 typedef struct {
     uint8_t *bytes;
     size_t size;
+    int directory_base;
 } Disk;
 
 typedef struct {
@@ -115,7 +117,7 @@ static void default_disk_name(const char *path, char out[18]) {
     size_t len = strlen(base);
     const char *dot = strrchr(base, '.');
     if (dot != NULL && dot != base) len = (size_t)(dot - base);
-    if (len > 17) len = 17;
+    if (len > 16) len = 16;
     memcpy(out, base, len);
     out[len] = '\0';
 }
@@ -254,6 +256,7 @@ static void write_record(Disk *disk, int record, const uint8_t data[SECTOR_SIZE]
 
 static void build_blank_d88(Disk *disk, const char *title) {
     disk->size = DISK_SIZE;
+    disk->directory_base = DIRECTORY_START_RECORD;
     disk->bytes = calloc(1, DISK_SIZE);
     if (!disk->bytes) die("out of memory");
 
@@ -285,6 +288,7 @@ static void build_blank_d88(Disk *disk, const char *title) {
 
 static void load_disk(Disk *disk, const char *path) {
     disk->size = read_file(path, &disk->bytes);
+    disk->directory_base = DIRECTORY_START_RECORD;
     if (disk->size < DISK_SIZE) die2("unsupported D88 image: ", path);
 }
 
@@ -334,7 +338,7 @@ static void entry_to_raw(const DirectoryEntry *entry, uint8_t raw[DIRECTORY_ENTR
 
 static void read_directory_entry(Disk *disk, int index, DirectoryEntry *entry) {
     uint8_t record_data[SECTOR_SIZE];
-    int record = DIRECTORY_START_RECORD + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE);
+    int record = disk->directory_base + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE);
     int offset = (index * DIRECTORY_ENTRY_SIZE) % SECTOR_SIZE;
     read_record(disk, record, record_data);
     parse_entry(record_data + offset, entry);
@@ -343,7 +347,7 @@ static void read_directory_entry(Disk *disk, int index, DirectoryEntry *entry) {
 static void write_directory_entry(Disk *disk, int index, const DirectoryEntry *entry) {
     uint8_t record_data[SECTOR_SIZE];
     uint8_t raw[DIRECTORY_ENTRY_SIZE];
-    int record = DIRECTORY_START_RECORD + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE);
+    int record = disk->directory_base + (index * DIRECTORY_ENTRY_SIZE / SECTOR_SIZE);
     int offset = (index * DIRECTORY_ENTRY_SIZE) % SECTOR_SIZE;
     read_record(disk, record, record_data);
     entry_to_raw(entry, raw);
@@ -353,6 +357,15 @@ static void write_directory_entry(Disk *disk, int index, const DirectoryEntry *e
 
 static uint32_t entry_byte_length(const DirectoryEntry *entry) {
     return entry->mode == MODE_BRD ? (uint32_t)entry->length * 32U : entry->length;
+}
+
+static void timestamp_text(const uint8_t bytes[4], char out[15]) {
+    int year = (bytes[0] >> 4) * 10 + (bytes[0] & 15);
+    int month = (bytes[1] >> 7) * 10 + ((bytes[1] >> 3) & 15);
+    int day = ((bytes[1] >> 1) & 3) * 10 + ((bytes[1] & 1) << 3) + (bytes[2] >> 5);
+    int hour = ((bytes[2] >> 3) & 3) * 10 + ((bytes[2] & 7) << 1) + (bytes[3] >> 7);
+    int minute = ((bytes[3] >> 4) & 7) * 10 + (bytes[3] & 15);
+    snprintf(out, 15, "%02d-%02d-%02d %02d:%02d", year, month, day, hour, minute);
 }
 
 static int find_entry(Disk *disk, const char *name, DirectoryEntry *entry_out) {
@@ -374,6 +387,57 @@ static int find_empty_directory_index(Disk *disk) {
         if (!entry_used(&entry)) return i;
     }
     return -1;
+}
+
+static void validate_name(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len > 16 || streq(name, ".") || streq(name, "..") || strchr(name, '\r')) {
+        die2("invalid disk name: ", name);
+    }
+}
+
+static int valid_directory_record(int record) {
+    return record >= DATA_OFFSET_BLOCK * BLOCK_FACTOR &&
+           record <= TOTAL_RECORDS - DIRECTORY_RECORDS && record % BLOCK_FACTOR == 0;
+}
+
+static void resolve_directory(Disk *disk, const char *path) {
+    char copy[512];
+    copy_cstr(copy, sizeof(copy), path);
+    if (strlen(path) >= sizeof(copy)) die("directory path is too long");
+    disk->directory_base = DIRECTORY_START_RECORD;
+    char *part = copy;
+    while (*part) {
+        while (*part == '/' || *part == '\\') part++;
+        if (!*part) break;
+        char *end = part;
+        while (*end && *end != '/' && *end != '\\') end++;
+        char saved = *end;
+        *end = '\0';
+        validate_name(part);
+        DirectoryEntry entry;
+        if (find_entry(disk, part, &entry) < 0 || entry.mode != MODE_DIR) die2("directory not found: ", part);
+        if (!valid_directory_record(entry.start_record)) die("invalid directory location");
+        disk->directory_base = entry.start_record;
+        if (!saved) break;
+        part = end + 1;
+    }
+}
+
+static void resolve_parent(Disk *disk, const char *path, char leaf[18]) {
+    char copy[512];
+    if (strlen(path) >= sizeof(copy)) die("disk path is too long");
+    copy_cstr(copy, sizeof(copy), path);
+    size_t len = strlen(copy);
+    while (len > 0 && (copy[len - 1] == '/' || copy[len - 1] == '\\')) copy[--len] = '\0';
+    char *slash = strrchr(copy, '/');
+    char *backslash = strrchr(copy, '\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+    const char *name = slash ? slash + 1 : copy;
+    validate_name(name);
+    copy_cstr(leaf, 18, name);
+    if (slash) *slash = '\0';
+    resolve_directory(disk, slash ? copy : "/");
 }
 
 static void read_bitmap(Disk *disk, uint8_t used[DATA_BLOCKS]) {
@@ -459,10 +523,11 @@ static void encode_time_bytes(uint8_t out[4]) {
     int month = tm->tm_mon + 1;
     int day = tm->tm_mday;
     int hour = tm->tm_hour;
+    int minute = tm->tm_min;
     out[0] = (uint8_t)(((year / 10) << 4) | (year % 10));
-    out[1] = (uint8_t)(((month / 10) << 4) | (month % 10));
-    out[2] = (uint8_t)(((day / 10) << 4) | (day % 10));
-    out[3] = (uint8_t)(((hour / 10) << 4) | (hour % 10));
+    out[1] = (uint8_t)(((month / 10) << 7) | ((month % 10) << 3) | ((day / 10) << 1) | ((day % 10) >> 3));
+    out[2] = (uint8_t)((((day % 10) & 7) << 5) | ((hour / 10) << 3) | ((hour % 10) >> 1));
+    out[3] = (uint8_t)((((hour % 10) & 1) << 7) | ((minute / 10) << 4) | (minute % 10));
 }
 
 static void format_data_disk(Disk *disk) {
@@ -487,6 +552,61 @@ static void format_data_disk(Disk *disk) {
 static void blank_disk(Disk *disk, const char *title) {
     build_blank_d88(disk, title);
     format_data_disk(disk);
+}
+
+static DirectoryEntry make_directory(Disk *disk, const char *path) {
+    char name[18];
+    resolve_parent(disk, path, name);
+    int parent_base = disk->directory_base;
+    if (find_entry(disk, name, NULL) >= 0) die2("file already exists: ", name);
+    int index = find_empty_directory_index(disk);
+    if (index < 0) die("directory is full");
+    int start_block = find_free_run(disk, DIRECTORY_RECORDS / BLOCK_FACTOR);
+    if (start_block < 0) die("not enough contiguous free space");
+    int blocks[DIRECTORY_RECORDS / BLOCK_FACTOR];
+    for (int i = 0; i < DIRECTORY_RECORDS / BLOCK_FACTOR; i++) blocks[i] = start_block + i;
+    mark_blocks(disk, blocks, DIRECTORY_RECORDS / BLOCK_FACTOR, 1);
+
+    int child_base = start_block * BLOCK_FACTOR;
+    uint8_t zero[SECTOR_SIZE] = {0};
+    for (int i = 0; i < DIRECTORY_RECORDS; i++) write_record(disk, child_base + i, zero);
+    uint8_t timestamp[4];
+    encode_time_bytes(timestamp);
+    disk->directory_base = child_base;
+    DirectoryEntry entry;
+    empty_entry(0, &entry);
+    copy_cstr(entry.name, sizeof(entry.name), name);
+    entry.attr = 0x81;
+    entry.length = DIRECTORY_RECORDS * SECTOR_SIZE;
+    entry.load_addr = 1;
+    int in_component = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') in_component = 0;
+        else if (!in_component) { entry.load_addr++; in_component = 1; }
+    }
+    entry.start_record = (uint16_t)child_base;
+    memcpy(entry.timestamp, timestamp, 4);
+    write_directory_entry(disk, 0, &entry);
+    for (int i = 1; i <= 2; i++) {
+        empty_entry(i, &entry);
+        entry.mode = MODE_DIR;
+        copy_cstr(entry.name, sizeof(entry.name), i == 1 ? "." : "..");
+        entry.attr = 0x81;
+        entry.length = DIRECTORY_RECORDS * SECTOR_SIZE;
+        entry.start_record = (uint16_t)(i == 1 ? child_base : parent_base);
+        memcpy(entry.timestamp, timestamp, 4);
+        write_directory_entry(disk, i, &entry);
+    }
+    disk->directory_base = parent_base;
+    empty_entry(index, &entry);
+    entry.mode = MODE_DIR;
+    copy_cstr(entry.name, sizeof(entry.name), name);
+    entry.attr = 0x80;
+    entry.length = DIRECTORY_RECORDS * SECTOR_SIZE;
+    entry.start_record = (uint16_t)child_base;
+    memcpy(entry.timestamp, timestamp, 4);
+    write_directory_entry(disk, index, &entry);
+    return entry;
 }
 
 static int write_linear_data(Disk *disk, const uint8_t *data, size_t data_len, int *blocks_out, int *block_count_out) {
@@ -634,14 +754,8 @@ static void add_file(Disk *disk, const char *source_path, const char *name_optio
     uint8_t *data = NULL;
     size_t data_len = read_file(source_path, &data);
     char name[18];
-    if (name_option) {
-        size_t len = strlen(name_option);
-        if (len == 0) die("name is empty");
-        if (len > 17) die2("name is longer than 17 bytes: ", name_option);
-        copy_cstr(name, sizeof(name), name_option);
-    } else {
-        default_disk_name(source_path, name);
-    }
+    if (name_option) resolve_parent(disk, name_option, name);
+    else { default_disk_name(source_path, name); resolve_directory(disk, "/"); }
     if (!mode_set) mode = infer_mode(source_path);
     if ((has_load || has_exec) && mode != MODE_OBJ) die("--load-addr/--exec-addr can be used only with OBJ files");
 
@@ -649,6 +763,7 @@ static void add_file(Disk *disk, const char *source_path, const char *name_optio
     int existing_index = find_entry(disk, name, &existing);
     if (existing_index >= 0) {
         if (!force) die2("file already exists: ", name);
+        if (existing.mode == MODE_DIR) die2("cannot replace a directory: ", name);
         int blocks[2048];
         int block_count = entry_blocks(disk, &existing, blocks, 2048);
         uint8_t empty[BLOCK_FACTOR * SECTOR_SIZE];
@@ -693,10 +808,29 @@ static void add_file(Disk *disk, const char *source_path, const char *name_optio
     free(data);
 }
 
-static DirectoryEntry delete_one(Disk *disk, const char *name) {
+static DirectoryEntry delete_one(Disk *disk, const char *path, int recursive) {
+    char name[18];
+    resolve_parent(disk, path, name);
+    int parent_base = disk->directory_base;
     DirectoryEntry entry;
     int index = find_entry(disk, name, &entry);
-    if (index < 0) die2("file not found: ", name);
+    if (index < 0) die2("file not found: ", path);
+    if (entry.mode == MODE_DIR) {
+        if (!valid_directory_record(entry.start_record)) die("invalid directory location");
+        disk->directory_base = entry.start_record;
+        for (int i = 1; i < DIRECTORY_ENTRIES; i++) {
+            DirectoryEntry child;
+            read_directory_entry(disk, i, &child);
+            if (!entry_used(&child) || streq(child.name, ".") || streq(child.name, "..")) continue;
+            if (!recursive) die2("directory is not empty: ", path);
+            char child_path[512];
+            int n = snprintf(child_path, sizeof(child_path), "%s/%s", path, child.name);
+            if (n < 0 || n >= (int)sizeof(child_path)) die("disk path is too long");
+            delete_one(disk, child_path, 1);
+            disk->directory_base = entry.start_record;
+        }
+        disk->directory_base = parent_base;
+    }
     int blocks[2048];
     int block_count = entry_blocks(disk, &entry, blocks, 2048);
     uint8_t empty[BLOCK_FACTOR * SECTOR_SIZE];
@@ -710,8 +844,11 @@ static DirectoryEntry delete_one(Disk *disk, const char *name) {
 }
 
 static void extract_file(Disk *disk, const char *name, const char *output_path) {
+    char leaf[18];
+    resolve_parent(disk, name, leaf);
     DirectoryEntry entry;
-    if (find_entry(disk, name, &entry) < 0) die2("file not found: ", name);
+    if (find_entry(disk, leaf, &entry) < 0) die2("file not found: ", name);
+    if (entry.mode == MODE_DIR) die("cannot extract a directory");
     uint32_t length = entry_byte_length(&entry);
     uint8_t *out = malloc(length ? length : 1);
     if (!out) die("out of memory");
@@ -763,11 +900,12 @@ static void extract_file(Disk *disk, const char *name, const char *output_path) 
 static void usage(void) {
     puts("usage:");
     puts("  mzd88 -blank OUTPUT.d88 [--title TITLE]");
-    puts("  mzd88 -list IMAGE.d88 [--free]");
-    puts("  mzd88 -add IMAGE.d88 SOURCE... [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]");
-    puts("  mzd88 -extract IMAGE.d88 NAME OUTPUT");
-    puts("  mzd88 -delete IMAGE.d88 NAME... | --all");
-    puts("  mzd88 -rename IMAGE.d88 OLD_NAME NEW_NAME");
+    puts("  mzd88 -list IMAGE.d88 [DIR] [--free]");
+    puts("  mzd88 -mkdir IMAGE.d88 DIR...");
+    puts("  mzd88 -add IMAGE.d88 SOURCE... [--dir DIR] [--name NAME] [--mode bsd|brd|btx|obj] [--force] [--load-addr ADDR] [--exec-addr ADDR]");
+    puts("  mzd88 -extract IMAGE.d88 PATH OUTPUT");
+    puts("  mzd88 -delete IMAGE.d88 PATH... [--recursive] | --all [--dir DIR]");
+    puts("  mzd88 -rename IMAGE.d88 OLD_PATH NEW_PATH");
 }
 
 static void cmd_blank(int argc, char **argv) {
@@ -796,6 +934,8 @@ static void cmd_blank(int argc, char **argv) {
 static void cmd_list(int argc, char **argv) {
     int show_free = 0;
     const char *image_path = NULL;
+    const char *directory = "/";
+    int has_directory = 0;
     for (int i = 0; i < argc; i++) {
         if (streq(argv[i], "--free")) {
             show_free = 1;
@@ -803,6 +943,9 @@ static void cmd_list(int argc, char **argv) {
             die2("unknown option: ", argv[i]);
         } else if (!image_path) {
             image_path = argv[i];
+        } else if (!has_directory) {
+            directory = argv[i];
+            has_directory = 1;
         } else {
             die2("unexpected argument: ", argv[i]);
         }
@@ -810,14 +953,17 @@ static void cmd_list(int argc, char **argv) {
     if (!image_path) die("missing D88 path");
     Disk disk;
     load_disk(&disk, image_path);
-    puts("idx mode name              bytes  start  load  exec");
+    resolve_directory(&disk, directory);
+    puts("idx mode name              bytes  start  load  exec  date");
     for (int index = 0; index < DIRECTORY_ENTRIES; index++) {
         DirectoryEntry entry;
         read_directory_entry(&disk, index, &entry);
-        if (entry_used(&entry)) {
-            printf("%3d %-4s %-17s %6u  %04X  %04X  %04X\n",
+        if (entry_used(&entry) && !streq(entry.name, ".") && !streq(entry.name, "..")) {
+            char date[15];
+            timestamp_text(entry.timestamp, date);
+            printf("%3d %-4s %-17s %6u  %04X  %04X  %04X  %s\n",
                    index, mode_name(entry.mode), entry.name, entry_byte_length(&entry),
-                   entry.start_record, entry.load_addr, entry.exec_addr);
+                   entry.start_record, entry.load_addr, entry.exec_addr, date);
         }
     }
     if (show_free) {
@@ -827,11 +973,26 @@ static void cmd_list(int argc, char **argv) {
     free(disk.bytes);
 }
 
+static void cmd_mkdir(int argc, char **argv) {
+    if (argc < 1) die("missing D88 path");
+    if (argc < 2) die("missing directory path");
+    Disk disk;
+    load_disk(&disk, argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (starts_with_dash(argv[i])) die2("unknown option: ", argv[i]);
+        make_directory(&disk, argv[i]);
+        printf("created %s\n", argv[i]);
+    }
+    save_disk(&disk, argv[0]);
+    free(disk.bytes);
+}
+
 static void cmd_add(int argc, char **argv) {
     uint8_t mode = 0;
     int mode_set = 0, force = 0, has_load = 0, has_exec = 0;
     uint16_t load_addr = 0, exec_addr = 0;
     const char *name = NULL;
+    const char *directory = "/";
     const char *positionals[256];
     int positional_count = 0;
     for (int i = 0; i < argc; i++) {
@@ -844,6 +1005,9 @@ static void cmd_add(int argc, char **argv) {
             if (i + 1 >= argc) die("missing --name value");
             name = argv[i + 1];
             i++;
+        } else if (streq(argv[i], "--dir")) {
+            if (i + 1 >= argc) die("missing --dir value");
+            directory = argv[++i];
         } else if (streq(argv[i], "--force")) {
             force = 1;
         } else if (streq(argv[i], "--load-addr")) {
@@ -871,8 +1035,15 @@ static void cmd_add(int argc, char **argv) {
     Disk disk;
     if (file_exists(image_path)) load_disk(&disk, image_path);
     else blank_disk(&disk, "BLANK");
+    resolve_directory(&disk, directory);
     for (int i = 1; i < positional_count; i++) {
-        add_file(&disk, positionals[i], name, mode_set, mode, force, has_load, load_addr, has_exec, exec_addr);
+        char default_name[18];
+        if (!name) default_disk_name(positionals[i], default_name);
+        const char *leaf = name ? name : default_name;
+        char target[512];
+        int n = snprintf(target, sizeof(target), "%s/%s", directory, leaf);
+        if (n < 0 || n >= (int)sizeof(target)) die("disk path is too long");
+        add_file(&disk, positionals[i], target, mode_set, mode, force, has_load, load_addr, has_exec, exec_addr);
     }
     save_disk(&disk, image_path);
     free(disk.bytes);
@@ -880,11 +1051,18 @@ static void cmd_add(int argc, char **argv) {
 
 static void cmd_delete(int argc, char **argv) {
     int delete_all = 0;
+    int recursive = 0;
+    const char *directory = "/";
     const char *positionals[256];
     int positional_count = 0;
     for (int i = 0; i < argc; i++) {
         if (streq(argv[i], "--all")) {
             delete_all = 1;
+        } else if (streq(argv[i], "--recursive")) {
+            recursive = 1;
+        } else if (streq(argv[i], "--dir")) {
+            if (i + 1 >= argc) die("missing --dir value");
+            directory = argv[++i];
         } else if (starts_with_dash(argv[i])) {
             die2("unknown option: ", argv[i]);
         } else {
@@ -898,21 +1076,26 @@ static void cmd_delete(int argc, char **argv) {
     load_disk(&disk, image_path);
     if (delete_all) {
         if (positional_count > 1) die("--all cannot be combined with file names");
+        resolve_directory(&disk, directory);
         char names[DIRECTORY_ENTRIES][18];
         int count = 0;
         for (int idx = 0; idx < DIRECTORY_ENTRIES; idx++) {
             DirectoryEntry entry;
             read_directory_entry(&disk, idx, &entry);
-            if (entry_used(&entry)) copy_cstr(names[count++], sizeof(names[0]), entry.name);
+            if (entry_used(&entry) && !streq(entry.name, ".") && !streq(entry.name, ".."))
+                copy_cstr(names[count++], sizeof(names[0]), entry.name);
         }
         for (int n = 0; n < count; n++) {
-            DirectoryEntry entry = delete_one(&disk, names[n]);
+            char target[512];
+            int len = snprintf(target, sizeof(target), "%s/%s", directory, names[n]);
+            if (len < 0 || len >= (int)sizeof(target)) die("disk path is too long");
+            DirectoryEntry entry = delete_one(&disk, target, 1);
             printf("deleted %s\n", entry.name);
         }
     } else {
         if (positional_count < 2) die("missing file name");
         for (int i = 1; i < positional_count; i++) {
-            DirectoryEntry entry = delete_one(&disk, positionals[i]);
+            DirectoryEntry entry = delete_one(&disk, positionals[i], recursive);
             printf("deleted %s\n", entry.name);
         }
     }
@@ -926,13 +1109,16 @@ static void cmd_rename(int argc, char **argv) {
     load_disk(&disk, argv[0]);
     const char *old_name = argv[1];
     const char *new_name = argv[2];
-    if (strlen(new_name) == 0) die("name is empty");
-    if (strlen(new_name) > 17) die2("name is longer than 17 bytes: ", new_name);
-    if (find_entry(&disk, new_name, NULL) >= 0) die2("file already exists: ", new_name);
+    char old_leaf[18], new_leaf[18];
+    resolve_parent(&disk, new_name, new_leaf);
+    int new_base = disk.directory_base;
+    if (find_entry(&disk, new_leaf, NULL) >= 0) die2("file already exists: ", new_name);
+    resolve_parent(&disk, old_name, old_leaf);
+    if (disk.directory_base != new_base) die("moving between directories is not supported");
     DirectoryEntry entry;
-    int index = find_entry(&disk, old_name, &entry);
+    int index = find_entry(&disk, old_leaf, &entry);
     if (index < 0) die2("file not found: ", old_name);
-    copy_cstr(entry.name, sizeof(entry.name), new_name);
+    copy_cstr(entry.name, sizeof(entry.name), new_leaf);
     encode_time_bytes(entry.timestamp);
     write_directory_entry(&disk, index, &entry);
     save_disk(&disk, argv[0]);
@@ -960,6 +1146,7 @@ int main(int argc, char **argv) {
     }
     if (streq(cmd, "blank")) cmd_blank(argc - 2, argv + 2);
     else if (streq(cmd, "list") || streq(cmd, "ls")) cmd_list(argc - 2, argv + 2);
+    else if (streq(cmd, "mkdir")) cmd_mkdir(argc - 2, argv + 2);
     else if (streq(cmd, "add")) cmd_add(argc - 2, argv + 2);
     else if (streq(cmd, "delete") || streq(cmd, "del") || streq(cmd, "rm")) cmd_delete(argc - 2, argv + 2);
     else if (streq(cmd, "rename") || streq(cmd, "ren") || streq(cmd, "mv")) cmd_rename(argc - 2, argv + 2);
