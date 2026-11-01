@@ -607,7 +607,9 @@ module MZD88
       raise Error, "not enough contiguous free space" unless start_block
 
       start_record = start_block * BLOCK_FACTOR
-      block_count.times { |i| write_block(start_block + i, "\xBF".b * (BLOCK_FACTOR * SECTOR_SIZE)) }
+      empty_block = "\xBF".b * (BLOCK_FACTOR * SECTOR_SIZE)
+      MZD88.put_le16(empty_block, empty_block.bytesize - 2, 0)
+      block_count.times { |i| write_block(start_block + i, empty_block) }
 
       record_count.times do |i|
         record = start_record + i

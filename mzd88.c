@@ -636,6 +636,7 @@ static int write_bsd_data(Disk *disk, const uint8_t *data, size_t data_len, int 
     if (start_block < 0) die("not enough contiguous free space");
     uint8_t empty_block[BLOCK_FACTOR * SECTOR_SIZE];
     memset(empty_block, 0xbf, sizeof(empty_block));
+    put_le16(empty_block + sizeof(empty_block) - 2, 0);
     for (int i = 0; i < block_count; i++) {
         blocks_out[i] = start_block + i;
         write_block(disk, start_block + i, empty_block);
